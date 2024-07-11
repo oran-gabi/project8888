@@ -8,7 +8,11 @@ from datetime import datetime
 from functools import wraps
 import logging
 from logging.handlers import RotatingFileHandler
+from werkzeug.utils import secure_filename
+
 import os
+
+
 
 # Function to set up logging
 def setup_logging(app):
@@ -29,7 +33,10 @@ CORS(app, resources={r"/*": {"origins": "http://127.0.0.1:5500"}}, supports_cred
 setup_logging(app)
 
 # Configuration
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///project.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_key'  # Change this in production
@@ -40,6 +47,8 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'connect_args': {'check_same_thread':
 # Initialize extensions
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
+
+
 
 # Models
 class Book(db.Model):
@@ -107,6 +116,8 @@ class User(db.Model):
     def __repr__(self):
         return f'<User {self.username}>'
 
+    
+
 def admin_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -116,6 +127,25 @@ def admin_required(fn):
             return jsonify({'error': 'Admin access required'}), 403
         return fn(*args, **kwargs)
     return wrapper
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+@app.route('/upload', methods=['POST'])
+@jwt_required()
+@admin_required
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+        return jsonify({'message': 'File uploaded successfully', 'filename': filename}), 201
+    else:
+        return jsonify({'error': 'File type not allowed'}), 400
 
 
 # Routes
@@ -180,17 +210,39 @@ def admin_only():
 @app.route('/books', methods=['GET', 'POST', 'OPTIONS'])
 def handle_books():
     if request.method == 'OPTIONS':
-        return '', 200  # Preflight request response
+        # Respond to preflight requests
+        response = app.make_default_options_response()
+        response.headers['Access-Control-Allow-Origin'] = 'http://127.0.0.1:5500'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        return response
+
     elif request.method == 'GET':
+        # Retrieve and return all books
         books = Book.query.all()
         return jsonify({'books': [book.serialize() for book in books]}), 200
+
     elif request.method == 'POST':
-        data = request.json
+        # Handle new book creation
+        data = request.form
         name = data.get('name')
         author = data.get('author')
         year = data.get('year')
         type = data.get('type')
-        image_filename = data.get('image_filename')
+
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file part'}), 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No selected file'}), 400
+
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            image_filename = filename
+        else:
+            return jsonify({'error': 'File type not allowed'}), 400
 
         if not name or not author or not year or not type:
             return jsonify({'error': 'Missing required fields'}), 400
@@ -206,6 +258,7 @@ def handle_books():
         db.session.commit()
 
         return jsonify({'message': 'Book added successfully', 'book': new_book.serialize()}), 201
+
 
 
 @app.route('/api/books/<int:book_id>', methods=['PUT'])
