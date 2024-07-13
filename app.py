@@ -11,6 +11,18 @@ from logging.handlers import RotatingFileHandler
 import os
 import logging
 
+''''
+Imports: Import necessary modules and classes for Flask, SQLAlchemy
+ (for database management), JWTManager (for JSON Web Token handling),
+CORS (for Cross-Origin Resource Sharing), Werkzeug (for security and file handling),
+ logging (for logging events), and other standard Python libraries.
+
+'''
+''''
+setup_logging: Sets up logging for the Flask application, creating a log directory if it doesn't exist,
+ defining log file properties, and logging startup information.
+
+'''
 # Function to set up logging
 def setup_logging(app):
     if not os.path.exists('logs'):
@@ -22,12 +34,24 @@ def setup_logging(app):
     app.logger.setLevel(logging.INFO)
     app.logger.info('Library management startup')
 
+
+'''
+Flask Configuration: Initializes the Flask application,
+sets up CORS to allow requests from http://127.0.0.1:5500,
+and calls setup_logging to configure logging.
+'''    
+
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "http://127.0.0.1:5500"}}, supports_credentials=True)
 setup_logging(app)
 
-# Configuration
+# Configuration 
+'''
+App Configuration: Sets up various configurations including file upload settings, database URI (sqlite:///project.db), JWT secret key (with a fallback to a default key),
+CORS headers, maximum content length for file uploads,
+and SQLAlchemy engine options.
+'''
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -39,10 +63,19 @@ app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB max file size
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'connect_args': {'check_same_thread': False}}
 
 # Initialize extensions
+'''
+Extensions Initialization: Initializes SQLAlchemy for database operations (db) and JWTManager
+ for handling JWT authentication (jwt).
+'''
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
 # Models
+"""
+Models: Defines SQLAlchemy models for Book, Customer,
+Loan, and User, representing tables in the database
+with specific fields and relationships.
+"""
 class Book(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(255), nullable=False)
@@ -114,6 +147,13 @@ class User(db.Model):
 
     def __repr__(self):
         return f'<User {self.username}>'
+# admin:
+''''
+Utility Functions: admin_required decorator to
+enforce admin role requirement for endpoints,
+and allowed_file function to check if uploaded
+file extensions are allowed.
+'''
 
 def admin_required(fn):
     @wraps(fn)
@@ -125,10 +165,10 @@ def admin_required(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-def allowed_file(filename):
+def allowed_file(filename):     # Function to check if a file has an allowed extension
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-@app.route('/upload', methods=['POST'])
+@app.route('/api/upload', methods=['POST'])
 @jwt_required()
 @admin_required
 def upload_file():
@@ -159,9 +199,12 @@ def register():
     username = data.get('username')
     password = data.get('password')
     role = data.get('role')
+    name = data.get('name')
+    city = data.get('city')
+    age = data.get('age')
 
-    if not username or not password or not role:
-        return jsonify({'error': 'Missing username, password, or role'}), 400
+    if not username or not password or not role or not name:
+        return jsonify({'error': 'Missing required fields'}), 400
 
     existing_user = User.query.filter_by(username=username).first()
     if existing_user:
@@ -170,10 +213,16 @@ def register():
     if role not in ['admin', 'client']:
         return jsonify({'error': 'Invalid role'}), 400
 
-    new_user = User(username=username, password=password, role=role)
+    new_customer = Customer(name=name, city=city, age=age)
+    db.session.add(new_customer)
+    db.session.commit()
+
+    new_user = User(username=username, password=password, role=role, customer_id=new_customer.id)
     db.session.add(new_user)
     db.session.commit()
+
     return jsonify({'message': 'User registered successfully', 'user': new_user.username}), 201
+
 
 # User Login
 @app.route('/api/login', methods=['POST'])
@@ -195,7 +244,7 @@ def login():
 # Books CRUD
 @app.route('/api/books', methods=['GET', 'POST'])
 @jwt_required()
-@admin_required
+@admin_required   # Decorator function to enforce admin role requirement
 def handle_books():
     if request.method == 'GET':
         books = Book.query.filter_by(deleted=False).all()
@@ -353,8 +402,10 @@ def handle_loan(id):
         db.session.commit()
         return jsonify({'message': 'Loan deleted successfully'}), 200
 
-# Serve uploaded files
-@app.route('/uploads/<filename>')
+
+# Serve uploaded files: Endpoints: Defines Flask endpoints (/upload, error handler)
+#  for handling file uploads (restricted to admins) and global exception handling.
+@app.route('/api/uploads/<filename>')
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
