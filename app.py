@@ -11,18 +11,6 @@ from logging.handlers import RotatingFileHandler
 import os
 import logging
 
-''''
-Imports: Import necessary modules and classes for Flask, SQLAlchemy
- (for database management), JWTManager (for JSON Web Token handling),
-CORS (for Cross-Origin Resource Sharing), Werkzeug (for security and file handling),
- logging (for logging events), and other standard Python libraries.
-
-'''
-''''
-setup_logging: Sets up logging for the Flask application, creating a log directory if it doesn't exist,
- defining log file properties, and logging startup information.
-
-'''
 # Function to set up logging
 def setup_logging(app):
     if not os.path.exists('logs'):
@@ -34,24 +22,12 @@ def setup_logging(app):
     app.logger.setLevel(logging.INFO)
     app.logger.info('Library management startup')
 
-
-'''
-Flask Configuration: Initializes the Flask application,
-sets up CORS to allow requests from http://127.0.0.1:5500,
-and calls setup_logging to configure logging.
-'''    
-
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "http://127.0.0.1:5500"}}, supports_credentials=True)
 setup_logging(app)
 
 # Configuration 
-'''
-App Configuration: Sets up various configurations including file upload settings, database URI (sqlite:///project.db), JWT secret key (with a fallback to a default key),
-CORS headers, maximum content length for file uploads,
-and SQLAlchemy engine options.
-'''
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -63,19 +39,10 @@ app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB max file size
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'connect_args': {'check_same_thread': False}}
 
 # Initialize extensions
-'''
-Extensions Initialization: Initializes SQLAlchemy for database operations (db) and JWTManager
- for handling JWT authentication (jwt).
-'''
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
 # Models
-"""
-Models: Defines SQLAlchemy models for Book, Customer,
-Loan, and User, representing tables in the database
-with specific fields and relationships.
-"""
 class Book(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(255), nullable=False)
@@ -147,14 +114,8 @@ class User(db.Model):
 
     def __repr__(self):
         return f'<User {self.username}>'
-# admin:
-''''
-Utility Functions: admin_required decorator to
-enforce admin role requirement for endpoints,
-and allowed_file function to check if uploaded
-file extensions are allowed.
-'''
 
+# Admin check decorator
 def admin_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -165,7 +126,8 @@ def admin_required(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-def allowed_file(filename):     # Function to check if a file has an allowed extension
+# Function to check if a file has an allowed extension
+def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 @app.route('/api/upload', methods=['POST'])
@@ -178,6 +140,8 @@ def upload_file():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
     if file and allowed_file(file.filename):
+        if not os.path.exists(app.config['UPLOAD_FOLDER']):
+            os.makedirs(app.config['UPLOAD_FOLDER'])
         filename = secure_filename(file.filename)
         file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
         return jsonify({'message': 'File uploaded successfully', 'filename': filename}), 201
@@ -213,6 +177,10 @@ def register():
     if role not in ['admin', 'client']:
         return jsonify({'error': 'Invalid role'}), 400
 
+    existing_customer = Customer.query.filter_by(name=name).first()
+    if existing_customer:
+        return jsonify({'error': 'Customer already exists'}), 400
+
     new_customer = Customer(name=name, city=city, age=age)
     db.session.add(new_customer)
     db.session.commit()
@@ -222,7 +190,6 @@ def register():
     db.session.commit()
 
     return jsonify({'message': 'User registered successfully', 'user': new_user.username}), 201
-
 
 # User Login
 @app.route('/api/login', methods=['POST'])
@@ -244,67 +211,56 @@ def login():
 # Books CRUD
 @app.route('/api/books', methods=['GET', 'POST'])
 @jwt_required()
-@admin_required   # Decorator function to enforce admin role requirement
-def handle_books():
+@admin_required
+def manage_books():
     if request.method == 'GET':
         books = Book.query.filter_by(deleted=False).all()
-        books_data = [{'id': book.id, 'name': book.name, 'author': book.author, 'year': book.year, 'type': book.type, 'image_filename': book.image_filename} for book in books]
-        return jsonify({'books': books_data}), 200
+        return jsonify([book.serialize() for book in books]), 200
 
-    elif request.method == 'POST':
-        data = request.json
+    if request.method == 'POST':
+        data = request.form
         name = data.get('name')
         author = data.get('author')
         year = data.get('year')
-        book_type = data.get('type')
-        image_filename = data.get('image_filename')
-
-        if not name or not author:
-            return jsonify({'error': 'Missing book name or author'}), 400
-
-        new_book = Book(name=name, author=author, year=year, type=book_type, image_filename=image_filename)
+        type = data.get('type')
+        file = request.files.get('image')
+        if not name or not author or not year or not type:
+            return jsonify({'error': 'Missing required fields'}), 400
+        image_filename = None
+        if file and allowed_file(file.filename):
+            if not os.path.exists(app.config['UPLOAD_FOLDER']):
+                os.makedirs(app.config['UPLOAD_FOLDER'])
+            image_filename = secure_filename(file.filename)
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], image_filename))
+        new_book = Book(name=name, author=author, year=int(year), type=int(type), image_filename=image_filename)
         db.session.add(new_book)
         db.session.commit()
         return jsonify({'message': 'Book added successfully', 'book': new_book.serialize()}), 201
 
-    elif request.method == 'POST':
-        data = request.json
-        name = data.get('name')
-        author = data.get('author')
-        year = data.get('year')
-        book_type = data.get('type')
-        image_filename = data.get('image_filename')
-
-        if not name or not author:
-            return jsonify({'error': 'Missing book name or author'}), 400
-
-        new_book = Book(name=name, author=author, year=year, type=book_type, image_filename=image_filename)
-        db.session.add(new_book)
-        db.session.commit()
-        return jsonify({'message': 'Book added successfully', 'book': new_book.serialize()}), 201
-
-@app.route('/api/books/<int:id>', methods=['GET', 'PUT', 'DELETE'])
+@app.route('/api/books/<int:book_id>', methods=['GET', 'PUT', 'DELETE'])
 @jwt_required()
 @admin_required
-def handle_book(id):
-    book = Book.query.get_or_404(id)
+def book_details(book_id):
+    book = Book.query.get_or_404(book_id)
 
     if request.method == 'GET':
-        if book.deleted:
-            return jsonify({'error': 'Book not found'}), 404
         return jsonify(book.serialize()), 200
 
-    elif request.method == 'PUT':
-        data = request.json
+    if request.method == 'PUT':
+        data = request.form
         book.name = data.get('name', book.name)
         book.author = data.get('author', book.author)
         book.year = data.get('year', book.year)
         book.type = data.get('type', book.type)
-        book.image_filename = data.get('image_filename', book.image_filename)
+        file = request.files.get('image')
+        if file and allowed_file(file.filename):
+            image_filename = secure_filename(file.filename)
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], image_filename))
+            book.image_filename = image_filename
         db.session.commit()
         return jsonify({'message': 'Book updated successfully', 'book': book.serialize()}), 200
 
-    elif request.method == 'DELETE':
+    if request.method == 'DELETE':
         book.deleted = True
         db.session.commit()
         return jsonify({'message': 'Book deleted successfully'}), 200
@@ -313,37 +269,33 @@ def handle_book(id):
 @app.route('/api/customers', methods=['GET', 'POST'])
 @jwt_required()
 @admin_required
-def handle_customers():
+def manage_customers():
     if request.method == 'GET':
         customers = Customer.query.filter_by(deleted=False).all()
-        return jsonify({'customers': [customer.serialize() for customer in customers]}), 200
+        return jsonify([customer.serialize() for customer in customers]), 200
 
-    elif request.method == 'POST':
+    if request.method == 'POST':
         data = request.json
         name = data.get('name')
         city = data.get('city')
         age = data.get('age')
-
-        if not name:
-            return jsonify({'error': 'Missing customer name'}), 400
-
-        new_customer = Customer(name=name, city=city, age=age)
+        if not name or not city or not age:
+            return jsonify({'error': 'Missing required fields'}), 400
+        new_customer = Customer(name=name, city=city, age=int(age))
         db.session.add(new_customer)
         db.session.commit()
         return jsonify({'message': 'Customer added successfully', 'customer': new_customer.serialize()}), 201
 
-@app.route('/api/customers/<int:id>', methods=['GET', 'PUT', 'DELETE'])
+@app.route('/api/customers/<int:customer_id>', methods=['GET', 'PUT', 'DELETE'])
 @jwt_required()
 @admin_required
-def handle_customer(id):
-    customer = Customer.query.get_or_404(id)
+def customer_details(customer_id):
+    customer = Customer.query.get_or_404(customer_id)
 
     if request.method == 'GET':
-        if customer.deleted:
-            return jsonify({'error': 'Customer not found'}), 404
         return jsonify(customer.serialize()), 200
 
-    elif request.method == 'PUT':
+    if request.method == 'PUT':
         data = request.json
         customer.name = data.get('name', customer.name)
         customer.city = data.get('city', customer.city)
@@ -351,7 +303,7 @@ def handle_customer(id):
         db.session.commit()
         return jsonify({'message': 'Customer updated successfully', 'customer': customer.serialize()}), 200
 
-    elif request.method == 'DELETE':
+    if request.method == 'DELETE':
         customer.deleted = True
         db.session.commit()
         return jsonify({'message': 'Customer deleted successfully'}), 200
@@ -360,58 +312,82 @@ def handle_customer(id):
 @app.route('/api/loans', methods=['GET', 'POST'])
 @jwt_required()
 @admin_required
-def handle_loans():
+def manage_loans():
     if request.method == 'GET':
         loans = Loan.query.filter_by(deleted=False).all()
-        return jsonify({'loans': [loan.serialize() for loan in loans]}), 200
+        return jsonify([loan.serialize() for loan in loans]), 200
 
-    elif request.method == 'POST':
+    if request.method == 'POST':
         data = request.json
         cust_id = data.get('cust_id')
         book_id = data.get('book_id')
-
         if not cust_id or not book_id:
-            return jsonify({'error': 'Missing customer ID or book ID'}), 400
-
+            return jsonify({'error': 'Missing required fields'}), 400
         new_loan = Loan(cust_id=cust_id, book_id=book_id)
         db.session.add(new_loan)
         db.session.commit()
         return jsonify({'message': 'Loan added successfully', 'loan': new_loan.serialize()}), 201
 
-@app.route('/api/loans/<int:id>', methods=['GET', 'PUT', 'DELETE'])
+# Route to handle creating new loans
+@app.route('/api/loans', methods=['POST'])
 @jwt_required()
 @admin_required
-def handle_loan(id):
-    loan = Loan.query.get_or_404(id)
+def create_loan():
+    data = request.json
+    if not data or not all(k in data for k in ("cust_id", "book_id", "loan_date", "returndate")):
+        return jsonify({"error": "Missing required fields"}), 400
+
+    new_loan = Loan(
+        cust_id=data['cust_id'],
+        book_id=data['book_id'],
+        loan_date=data['loan_date'],
+        returndate=data['returndate']
+    )
+    db.session.add(new_loan)
+    db.session.commit()
+    return jsonify(new_loan.serialize()), 201
+
+# Route to handle loan details (GET, PUT, DELETE)
+@app.route('/api/loans/<int:loan_id>', methods=['GET', 'PUT', 'DELETE'])
+@jwt_required()
+@admin_required
+def loan_details(loan_id):
+    loan = Loan.query.get_or_404(loan_id)
 
     if request.method == 'GET':
-        if loan.deleted:
-            return jsonify({'error': 'Loan not found'}), 404
         return jsonify(loan.serialize()), 200
 
-    elif request.method == 'PUT':
+    if request.method == 'PUT':
         data = request.json
+        if not data or not all(k in data for k in ("cust_id", "book_id", "returndate")):
+            return jsonify({"error": "Missing required fields"}), 400
+        loan.returndate = data.get('returndate', loan.returndate)
         loan.cust_id = data.get('cust_id', loan.cust_id)
         loan.book_id = data.get('book_id', loan.book_id)
-        loan.returndate = data.get('returndate', loan.returndate)
         db.session.commit()
         return jsonify({'message': 'Loan updated successfully', 'loan': loan.serialize()}), 200
 
-    elif request.method == 'DELETE':
+    if request.method == 'DELETE':
         loan.deleted = True
         db.session.commit()
         return jsonify({'message': 'Loan deleted successfully'}), 200
 
 
-# Serve uploaded files: Endpoints: Defines Flask endpoints (/upload, error handler)
-#  for handling file uploads (restricted to admins) and global exception handling.
-@app.route('/api/uploads/<filename>')
+# Client user loan management
+@app.route('/api/client/loans', methods=['GET'])
+@jwt_required()
+def client_loans():
+    user_id = get_jwt_identity()
+    user = User.query.get_or_404(user_id)
+    loans = Loan.query.filter_by(cust_id=user.customer_id, deleted=False).all()
+    return jsonify([loan.serialize() for loan in loans]), 200
+
+# Route for serving uploaded images
+@app.route('/uploads/<filename>')
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-# Run the app
-
 if __name__ == '__main__':
     with app.app_context():
-        db.create_all()
-    app.run(debug=True)
+     db.create_all()
+     app.run(debug=True)
