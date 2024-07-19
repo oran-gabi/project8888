@@ -1,393 +1,436 @@
-from flask import Flask, jsonify, request, send_from_directory, make_response
+from flask import Flask, jsonify, request, send_from_directory, url_for
+from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, jwt_required, create_access_token, get_jwt_identity
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.exceptions import HTTPException
-from datetime import datetime
-from functools import wraps
 from werkzeug.utils import secure_filename
-from logging.handlers import RotatingFileHandler
 import os
 import logging
 
-# Function to set up logging
-def setup_logging(app):
-    if not os.path.exists('logs'):
-        os.mkdir('logs')
-    file_handler = RotatingFileHandler('logs/library_management.log', maxBytes=10240, backupCount=10)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'))
-    file_handler.setLevel(logging.INFO)
-    app.logger.addHandler(file_handler)
-    app.logger.setLevel(logging.INFO)
-    app.logger.info('Library management startup')
 
-# Initialize Flask app
+# Initialize the Flask app
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "http://127.0.0.1:5500"}}, supports_credentials=True)
-setup_logging(app)
 
-# Configuration 
-UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///project.db'
+# Configure the app
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///library.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your_jwt_secret_key')  # Change this in production
-app.config['CORS_HEADERS'] = 'Content-Type'
+app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_key'
+app.config['UPLOAD_FOLDER'] = os.path.join(os.getcwd(), 'backend', 'static')
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB max file size
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'connect_args': {'check_same_thread': False}}
 
 # Initialize extensions
 db = SQLAlchemy(app)
+migrate = Migrate(app, db)
 jwt = JWTManager(app)
+CORS(app, resources={r"/*": {"origins": "http://127.0.0.1:5500"}}, supports_credentials=True)
 
-# Models
-class Book(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(255), nullable=False)
-    author = db.Column(db.String(255), nullable=False)
-    year = db.Column(db.Integer)
-    type = db.Column(db.Integer)
-    image_filename = db.Column(db.String(255))
-    deleted = db.Column(db.Boolean, default=False)
+# Setup logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-    def serialize(self):
-        return {
-            'id': self.id,
-            'name': self.name,
-            'author': self.author,
-            'year': self.year,
-            'type': self.type,
-            'image_filename': self.image_filename,
-            'deleted': self.deleted
-        }
+# Allowed image extensions
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 
-class Customer(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(255), nullable=False)
-    city = db.Column(db.String(255))
-    age = db.Column(db.Integer)
-    deleted = db.Column(db.Boolean, default=False)
-    users = db.relationship('User', backref='customer', lazy=True)
-
-    def serialize(self):
-        return {
-            'id': self.id,
-            'name': self.name,
-            'city': self.city,
-            'age': self.age,
-            'deleted': self.deleted
-        }
-
-class Loan(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    cust_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
-    book_id = db.Column(db.Integer, db.ForeignKey('book.id'), nullable=False)
-    loandate = db.Column(db.DateTime, default=datetime.utcnow)
-    returndate = db.Column(db.DateTime)
-    deleted = db.Column(db.Boolean, default=False)
-
-    def serialize(self):
-        return {
-            'id': self.id,
-            'cust_id': self.cust_id,
-            'book_id': self.book_id,
-            'loandate': self.loandate.isoformat(),
-            'returndate': self.returndate.isoformat() if self.returndate else None,
-            'deleted': self.deleted
-        }
-
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(50), unique=True, nullable=False)
-    password = db.Column(db.String(100), nullable=False)
-    role = db.Column(db.String(50), nullable=False)
-    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'))
-    deleted = db.Column(db.Boolean, default=False)
-
-    def __init__(self, username, password, role, customer_id=None):
-        self.username = username
-        self.password = generate_password_hash(password, method='sha256')
-        self.role = role
-        self.customer_id = customer_id
-
-    def __repr__(self):
-        return f'<User {self.username}>'
-
-# Admin check decorator
-def admin_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        current_user_id = get_jwt_identity()
-        user = User.query.get(current_user_id)
-        if not user or user.role != 'admin':
-            return jsonify({'error': 'Admin access required'}), 403
-        return fn(*args, **kwargs)
-    return wrapper
-
-# Function to check if a file has an allowed extension
+# Function to check if a file is allowed
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-@app.route('/api/upload', methods=['POST'])
-@jwt_required()
-@admin_required
-def upload_file():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    if file and allowed_file(file.filename):
-        if not os.path.exists(app.config['UPLOAD_FOLDER']):
-            os.makedirs(app.config['UPLOAD_FOLDER'])
-        filename = secure_filename(file.filename)
-        file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
-        return jsonify({'message': 'File uploaded successfully', 'filename': filename}), 201
-    else:
-        return jsonify({'error': 'File type not allowed'}), 400
+# Ensure the upload directory exists
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
 
-# Error handling
-@app.errorhandler(Exception)
-def handle_exception(e):
-    if isinstance(e, HTTPException):
-        return jsonify({'error': str(e)}), e.code
-    app.logger.error(f"Unhandled exception: {str(e)}")
-    return jsonify({'error': 'An unexpected error occurred'}), 500
+# Define the models
+class Book(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(100), nullable=False)
+    author = db.Column(db.String(100), nullable=False)
+    genre = db.Column(db.String(50))
+    published_date = db.Column(db.String(20))
+    is_deleted = db.Column(db.Boolean, default=False)
+    image_filename = db.Column(db.String(255))
 
-# User Registration
-@app.route('/api/register', methods=['POST'])
+class Customer(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    name = db.Column(db.String(100), nullable=False)
+    phone_number = db.Column(db.String(20))
+    email = db.Column(db.String(100))
+    address = db.Column(db.String(200))
+    is_deleted = db.Column(db.Boolean, default=False)
+    user = db.relationship('User', backref=db.backref('customer', uselist=False))
+
+class Loan(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    book_id = db.Column(db.Integer, db.ForeignKey('book.id'), nullable=False)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
+    loan_date = db.Column(db.String(20))
+    return_date = db.Column(db.String(20))
+    due_date = db.Column(db.String(20))
+    returned = db.Column(db.Boolean, default=False)
+    is_deleted = db.Column(db.Boolean, default=False)
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(200), nullable=False)
+    role = db.Column(db.String(20), nullable=False)
+
+# Helper method to convert model instances to dictionary
+def as_dict(self):
+    return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+# Add as_dict method to models
+Book.as_dict = as_dict
+Customer.as_dict = as_dict
+Loan.as_dict = as_dict
+User.as_dict = as_dict
+
+# Registration endpoint
+@app.route('/register', methods=['POST'])
 def register():
-    data = request.json
+    data = request.get_json()
     username = data.get('username')
     password = data.get('password')
-    role = data.get('role')
-    name = data.get('name')
-    city = data.get('city')
-    age = data.get('age')
+    role = data.get('role', 'customer')
 
-    if not username or not password or not role or not name:
-        return jsonify({'error': 'Missing required fields'}), 400
+    logger.debug(f"Registering user with username: {username}, role: {role}")
 
-    existing_user = User.query.filter_by(username=username).first()
-    if existing_user:
-        return jsonify({'error': 'Username already exists'}), 400
+    if User.query.filter_by(username=username).first():
+        return jsonify(message="Username already exists"), 400
 
-    if role not in ['admin', 'client']:
-        return jsonify({'error': 'Invalid role'}), 400
-
-    existing_customer = Customer.query.filter_by(name=name).first()
-    if existing_customer:
-        return jsonify({'error': 'Customer already exists'}), 400
-
-    new_customer = Customer(name=name, city=city, age=age)
-    db.session.add(new_customer)
-    db.session.commit()
-
-    new_user = User(username=username, password=password, role=role, customer_id=new_customer.id)
+    hashed_password = generate_password_hash(password)
+    new_user = User(username=username, password=hashed_password, role=role)
     db.session.add(new_user)
     db.session.commit()
 
-    return jsonify({'message': 'User registered successfully', 'user': new_user.username}), 201
+    logger.debug(f"User {username} registered successfully with ID: {new_user.id}")
 
-# User Login
-@app.route('/api/login', methods=['POST'])
-def login():
-    data = request.json
+    if role == 'customer':
+        new_customer = Customer(
+            user_id=new_user.id,
+            name=data.get('name'),
+            phone_number=data.get('phone_number'),
+            email=data.get('email'),
+            address=data.get('address')
+        )
+        db.session.add(new_customer)
+        db.session.commit()
+
+        logger.debug(f"Customer created successfully for user ID: {new_user.id}")
+
+    return jsonify(message="User registered successfully"), 201
+
+# Registration endpoint for admin
+@app.route('/register_admin', methods=['POST'])
+def register_admin():
+    data = request.get_json()
     username = data.get('username')
     password = data.get('password')
 
-    if not username or not password:
-        return jsonify({'error': 'Missing username or password'}), 400
+    if User.query.filter_by(username=username).first():
+        return jsonify(message="Username already exists"), 400
+
+    hashed_password = generate_password_hash(password)
+    new_user = User(username=username, password=hashed_password, role='admin')
+    db.session.add(new_user)
+    db.session.commit()
+
+    return jsonify(message="Admin registered successfully"), 201
+
+# Login endpoint
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
 
     user = User.query.filter_by(username=username).first()
     if not user or not check_password_hash(user.password, password):
-        return jsonify({'error': 'Invalid username or password'}), 401
+        return jsonify(message="Invalid credentials"), 401
 
-    access_token = create_access_token(identity=user.id)
-    return jsonify({'access_token': access_token}), 200
+    access_token = create_access_token(identity={'username': user.username, 'role': user.role})
+    return jsonify(access_token=access_token)
 
-# Books CRUD
-@app.route('/api/books', methods=['GET', 'POST'])
+# Role-based access control decorator
+def role_required(role):
+    def wrapper(fn):
+        @jwt_required()
+        def decorator(*args, **kwargs):
+            claims = get_jwt_identity()
+            if claims['role'] != role:
+                return jsonify(message="You are not authorized to access this resource"), 403
+            return fn(*args, **kwargs)
+        decorator.__name__ = fn.__name__
+        return decorator
+    return wrapper
+
+# CRUD operations for Books
+@app.route('/books', methods=['GET'])
 @jwt_required()
-@admin_required
-def manage_books():
-    if request.method == 'GET':
-        books = Book.query.filter_by(deleted=False).all()
-        return jsonify([book.serialize() for book in books]), 200
+def get_books():
+    try:
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
+        books_query = Book.query.filter_by(is_deleted=False).paginate(page, per_page, False)
+        
+        books_with_images = []
+        for book in books_query.items:
+            book_dict = book.as_dict()
+            if book.image_filename:
+                book_dict['image_url'] = url_for('uploaded_file', filename=book.image_filename, _external=True)
+            books_with_images.append(book_dict)
+        
+        response = {
+            'books': books_with_images,
+            'total': books_query.total,
+            'pages': books_query.pages,
+            'current_page': books_query.page
+        }
+        
+        return jsonify(response)
+    except Exception as e:
+        logger.error(f"Error in get_books: {str(e)}")
+        return jsonify(message="An error occurred"), 500
 
-    if request.method == 'POST':
-        data = request.form
-        name = data.get('name')
-        author = data.get('author')
-        year = data.get('year')
-        type = data.get('type')
-        file = request.files.get('image')
-        if not name or not author or not year or not type:
-            return jsonify({'error': 'Missing required fields'}), 400
-        image_filename = None
-        if file and allowed_file(file.filename):
-            if not os.path.exists(app.config['UPLOAD_FOLDER']):
-                os.makedirs(app.config['UPLOAD_FOLDER'])
-            image_filename = secure_filename(file.filename)
-            file.save(os.path.join(app.config['UPLOAD_FOLDER'], image_filename))
-        new_book = Book(name=name, author=author, year=int(year), type=int(type), image_filename=image_filename)
-        db.session.add(new_book)
-        db.session.commit()
-        return jsonify({'message': 'Book added successfully', 'book': new_book.serialize()}), 201
 
-@app.route('/api/books/<int:book_id>', methods=['GET', 'PUT', 'DELETE'])
+@app.route('/books/<int:id>', methods=['GET'])
 @jwt_required()
-@admin_required
-def book_details(book_id):
-    book = Book.query.get_or_404(book_id)
+def get_book(id):
+    book = Book.query.get_or_404(id)
+    if book.is_deleted:
+        return jsonify(error="Book not found"), 404
+    book_dict = book.as_dict()
+    if book.image_filename:
+        book_dict['image_url'] = url_for('uploaded_file', filename=book.image_filename, _external=True)
+    return jsonify(book_dict)
 
-    if request.method == 'GET':
-        return jsonify(book.serialize()), 200
+@app.route('/books', methods=['POST'])
+@role_required('admin')
+def add_book():
+    if 'image' not in request.files:
+        return jsonify(message="No image part in the request"), 400
 
-    if request.method == 'PUT':
-        data = request.form
-        book.name = data.get('name', book.name)
-        book.author = data.get('author', book.author)
-        book.year = data.get('year', book.year)
-        book.type = data.get('type', book.type)
-        file = request.files.get('image')
-        if file and allowed_file(file.filename):
-            image_filename = secure_filename(file.filename)
-            file.save(os.path.join(app.config['UPLOAD_FOLDER'], image_filename))
-            book.image_filename = image_filename
-        db.session.commit()
-        return jsonify({'message': 'Book updated successfully', 'book': book.serialize()}), 200
+    image = request.files['image']
+    if image.filename == '':
+        return jsonify(message="No image selected for uploading"), 400
 
-    if request.method == 'DELETE':
-        book.deleted = True
-        db.session.commit()
-        return jsonify({'message': 'Book deleted successfully'}), 200
+    if not allowed_file(image.filename):
+        return jsonify(message="File type is not allowed"), 400
 
-# Customers CRUD
-@app.route('/api/customers', methods=['GET', 'POST'])
-@jwt_required()
-@admin_required
-def manage_customers():
-    if request.method == 'GET':
-        customers = Customer.query.filter_by(deleted=False).all()
-        return jsonify([customer.serialize() for customer in customers]), 200
+    # Get other form data
+    title = request.form.get('title')
+    author = request.form.get('author')
 
-    if request.method == 'POST':
-        data = request.json
-        name = data.get('name')
-        city = data.get('city')
-        age = data.get('age')
-        if not name or not city or not age:
-            return jsonify({'error': 'Missing required fields'}), 400
-        new_customer = Customer(name=name, city=city, age=int(age))
-        db.session.add(new_customer)
-        db.session.commit()
-        return jsonify({'message': 'Customer added successfully', 'customer': new_customer.serialize()}), 201
+    if not title or not author:
+        return jsonify(message="Title and author are required"), 422
 
-@app.route('/api/customers/<int:customer_id>', methods=['GET', 'PUT', 'DELETE'])
-@jwt_required()
-@admin_required
-def customer_details(customer_id):
-    customer = Customer.query.get_or_404(customer_id)
+    filename = secure_filename(image.filename)
+    image.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
 
-    if request.method == 'GET':
-        return jsonify(customer.serialize()), 200
+    new_book = Book(
+        title=title,
+        author=author,
+        genre=request.form.get('genre'),
+        published_date=request.form.get('published_date'),
+        image_filename=filename
+    )
+    db.session.add(new_book)
+    db.session.commit()
 
-    if request.method == 'PUT':
-        data = request.json
-        customer.name = data.get('name', customer.name)
-        customer.city = data.get('city', customer.city)
-        customer.age = data.get('age', customer.age)
-        db.session.commit()
-        return jsonify({'message': 'Customer updated successfully', 'customer': customer.serialize()}), 200
+    return jsonify(message="Book added successfully"), 201
 
-    if request.method == 'DELETE':
-        customer.deleted = True
-        db.session.commit()
-        return jsonify({'message': 'Customer deleted successfully'}), 200
+@app.route('/books/<int:id>', methods=['PUT'])
+@role_required('admin')
+def update_book(id):
+    book = Book.query.get_or_404(id)
+    data = request.get_json()
+    book.title = data.get('title', book.title)
+    book.author = data.get('author', book.author)
+    book.genre = data.get('genre', book.genre)
+    book.published_date = data.get('published_date', book.published_date)
+    db.session.commit()
+    return jsonify(message="Book updated successfully")
 
-# Loans CRUD
-@app.route('/api/loans', methods=['GET', 'POST'])
-@jwt_required()
-@admin_required
-def manage_loans():
-    if request.method == 'GET':
-        loans = Loan.query.filter_by(deleted=False).all()
-        return jsonify([loan.serialize() for loan in loans]), 200
+@app.route('/books/<int:id>', methods=['DELETE'])
+@role_required('admin')
+def delete_book(id):
+    book = Book.query.get_or_404(id)
+    book.is_deleted = True
+    db.session.commit()
+    return jsonify(message="Book deleted successfully")
 
-    if request.method == 'POST':
-        data = request.json
-        cust_id = data.get('cust_id')
-        book_id = data.get('book_id')
-        if not cust_id or not book_id:
-            return jsonify({'error': 'Missing required fields'}), 400
-        new_loan = Loan(cust_id=cust_id, book_id=book_id)
-        db.session.add(new_loan)
-        db.session.commit()
-        return jsonify({'message': 'Loan added successfully', 'loan': new_loan.serialize()}), 201
+# CRUD operations for Customers
+@app.route('/customers', methods=['GET'])
+@role_required('admin')
+def get_customers():
+    customers = Customer.query.filter_by(is_deleted=False).all()
+    return jsonify([customer.as_dict() for customer in customers])
 
-# Route to handle creating new loans
-@app.route('/api/loans', methods=['POST'])
-@jwt_required()
-@admin_required
-def create_loan():
-    data = request.json
-    if not data or not all(k in data for k in ("cust_id", "book_id", "loan_date", "returndate")):
-        return jsonify({"error": "Missing required fields"}), 400
+@app.route('/customers/<int:id>', methods=['GET'])
+@role_required('admin')
+def get_customer(id):
+    customer = Customer.query.get_or_404(id)
+    if customer.is_deleted:
+        return jsonify(error="Customer not found"), 404
+    return jsonify(customer.as_dict())
 
+@app.route('/customers', methods=['POST'])
+@role_required('admin')
+def add_customer():
+    data = request.get_json()
+    new_customer = Customer(
+        user_id=data.get('user_id'),
+        name=data.get('name'),
+        phone_number=data.get('phone_number'),
+        email=data.get('email'),
+        address=data.get('address')
+    )
+    db.session.add(new_customer)
+    db.session.commit()
+    return jsonify(message="Customer added successfully"), 201
+
+@app.route('/customers/<int:id>', methods=['PUT'])
+@role_required('admin')
+def update_customer(id):
+    customer = Customer.query.get_or_404(id)
+    data = request.get_json()
+    customer.name = data.get('name', customer.name)
+    customer.phone_number = data.get('phone_number', customer.phone_number)
+    customer.email = data.get('email', customer.email)
+    customer.address = data.get('address', customer.address)
+    db.session.commit()
+    return jsonify(message="Customer updated successfully")
+
+@app.route('/customers/<int:id>', methods=['DELETE'])
+@role_required('admin')
+def delete_customer(id):
+    customer = Customer.query.get_or_404(id)
+    customer.is_deleted = True
+    db.session.commit()
+    return jsonify(message="Customer deleted successfully")
+
+# CRUD operations for Loans
+@app.route('/loans', methods=['GET'])
+@role_required('admin')
+def get_loans():
+    loans = Loan.query.filter_by(is_deleted=False).all()
+    loans_with_details = []
+    for loan in loans:
+        loan_dict = loan.as_dict()
+        loan_dict['book_title'] = Book.query.get(loan.book_id).title
+        loan_dict['customer_name'] = Customer.query.get(loan.customer_id).name
+        loans_with_details.append(loan_dict)
+    return jsonify(loans_with_details)
+
+@app.route('/loans/<int:id>', methods=['GET'])
+@role_required('admin')
+def get_loan(id):
+    loan = Loan.query.get_or_404(id)
+    if loan.is_deleted:
+        return jsonify(error="Loan not found"), 404
+    loan_dict = loan.as_dict()
+    loan_dict['book_title'] = Book.query.get(loan.book_id).title
+    loan_dict['customer_name'] = Customer.query.get(loan.customer_id).name
+    return jsonify(loan_dict)
+
+
+@app.route('/loans', methods=['POST'])
+@role_required('admin')
+def add_loan():
+    data = request.get_json()
     new_loan = Loan(
-        cust_id=data['cust_id'],
-        book_id=data['book_id'],
-        loan_date=data['loan_date'],
-        returndate=data['returndate']
+        book_id=data.get('book_id'),
+        customer_id=data.get('customer_id'),
+        loan_date=data.get('loan_date'),
+        return_date=data.get('return_date'),
+        due_date=data.get('due_date')
     )
     db.session.add(new_loan)
     db.session.commit()
-    return jsonify(new_loan.serialize()), 201
+    return jsonify(message="Loan added successfully"), 201
 
-# Route to handle loan details (GET, PUT, DELETE)
-@app.route('/api/loans/<int:loan_id>', methods=['GET', 'PUT', 'DELETE'])
+@app.route('/loans/<int:id>', methods=['PUT'])
+@role_required('admin')
+def update_loan(id):
+    loan = Loan.query.get_or_404(id)
+    data = request.get_json()
+    loan.book_id = data.get('book_id', loan.book_id)
+    loan.customer_id = data.get('customer_id', loan.customer_id)
+    loan.loan_date = data.get('loan_date', loan.loan_date)
+    loan.return_date = data.get('return_date', loan.return_date)
+    loan.due_date = data.get('due_date', loan.due_date)
+    loan.returned = data.get('returned', loan.returned)
+    db.session.commit()
+    return jsonify(message="Loan updated successfully")
+
+@app.route('/loans/<int:id>', methods=['DELETE'])
+@role_required('admin')
+def delete_loan(id):
+    loan = Loan.query.get_or_404(id)
+    loan.is_deleted = True
+    db.session.commit()
+    return jsonify(message="Loan deleted successfully")
+
+# CRUD operations for Client Loans
+
+@app.route('/client/loans', methods=['GET'])
 @jwt_required()
-@admin_required
-def loan_details(loan_id):
-    loan = Loan.query.get_or_404(loan_id)
+def get_client_loans():
+    current_user = get_jwt_identity()
+    customer = Customer.query.filter_by(user_id=current_user['id']).first_or_404()
+    
+    current_loans = Loan.query.filter_by(customer_id=customer.id, returned=False, is_deleted=False).all()
+    loan_history = Loan.query.filter_by(customer_id=customer.id, returned=True, is_deleted=False).all()
 
-    if request.method == 'GET':
-        return jsonify(loan.serialize()), 200
+    current_loans_with_details = []
+    for loan in current_loans:
+        loan_dict = loan.as_dict()
+        loan_dict['book_title'] = Book.query.get(loan.book_id).title
+        loan_dict['book_image'] = Book.query.get(loan.book_id).image_filename
+        current_loans_with_details.append(loan_dict)
+    
+    loan_history_with_details = []
+    for loan in loan_history:
+        loan_dict = loan.as_dict()
+        loan_dict['book_title'] = Book.query.get(loan.book_id).title
+        loan_dict['book_image'] = Book.query.get(loan.book_id).image_filename
+        loan_history_with_details.append(loan_dict)
+    
+    return jsonify({
+        'current_loans': current_loans_with_details,
+        'loan_history': loan_history_with_details
+    })
 
-    if request.method == 'PUT':
-        data = request.json
-        if not data or not all(k in data for k in ("cust_id", "book_id", "returndate")):
-            return jsonify({"error": "Missing required fields"}), 400
-        loan.returndate = data.get('returndate', loan.returndate)
-        loan.cust_id = data.get('cust_id', loan.cust_id)
-        loan.book_id = data.get('book_id', loan.book_id)
-        db.session.commit()
-        return jsonify({'message': 'Loan updated successfully', 'loan': loan.serialize()}), 200
-
-    if request.method == 'DELETE':
-        loan.deleted = True
-        db.session.commit()
-        return jsonify({'message': 'Loan deleted successfully'}), 200
-
-
-# Client user loan management
-@app.route('/api/client/loans', methods=['GET'])
+@app.route('/client/loans', methods=['POST'])
 @jwt_required()
-def client_loans():
-    user_id = get_jwt_identity()
-    user = User.query.get_or_404(user_id)
-    loans = Loan.query.filter_by(cust_id=user.customer_id, deleted=False).all()
-    return jsonify([loan.serialize() for loan in loans]), 200
+def add_client_loan():
+    data = request.get_json()
+    current_user = get_jwt_identity()
+    customer = Customer.query.filter_by(user_id=current_user['id']).first_or_404()
 
-# Route for serving uploaded images
+    new_loan = Loan(
+        book_id=data.get('book_id'),
+        customer_id=customer.id,
+        loan_date=data.get('loan_date'),
+        return_date=data.get('return_date'),
+        due_date=data.get('due_date')
+    )
+    db.session.add(new_loan)
+    db.session.commit()
+
+    return jsonify(message="Loan added successfully"), 201
+
+
+# Serve uploaded files
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
+# Run the app
+
 if __name__ == '__main__':
     with app.app_context():
-     db.create_all()
-     app.run(debug=True)
+        db.create_all()
+    app.run(debug=True)
