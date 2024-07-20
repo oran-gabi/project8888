@@ -8,7 +8,6 @@ from werkzeug.utils import secure_filename
 import os
 import logging
 
-
 # Initialize the Flask app
 app = Flask(__name__)
 
@@ -50,6 +49,7 @@ class Book(db.Model):
     published_date = db.Column(db.String(20))
     is_deleted = db.Column(db.Boolean, default=False)
     image_filename = db.Column(db.String(255))
+    loans = db.relationship('Loan', backref='book', lazy=True)
 
 class Customer(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -60,6 +60,7 @@ class Customer(db.Model):
     address = db.Column(db.String(200))
     is_deleted = db.Column(db.Boolean, default=False)
     user = db.relationship('User', backref=db.backref('customer', uselist=False))
+    loans = db.relationship('Loan', backref='customer', lazy=True)
 
 class Loan(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -173,7 +174,7 @@ def get_books():
     try:
         page = request.args.get('page', 1, type=int)
         per_page = request.args.get('per_page', 10, type=int)
-        books_query = Book.query.filter_by(is_deleted=False).paginate(page, per_page, False)
+        books_query = Book.query.filter_by(is_deleted=False).paginate(page=page, per_page=per_page, error_out=False)
         
         books_with_images = []
         for book in books_query.items:
@@ -193,7 +194,6 @@ def get_books():
     except Exception as e:
         logger.error(f"Error in get_books: {str(e)}")
         return jsonify(message="An error occurred"), 500
-
 
 @app.route('/books/<int:id>', methods=['GET'])
 @jwt_required()
@@ -224,52 +224,70 @@ def add_book():
     author = request.form.get('author')
 
     if not title or not author:
-        return jsonify(message="Title and author are required"), 422
+        return jsonify(message="Title and author are required"), 400
 
-    filename = secure_filename(image.filename)
-    image.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+    try:
+        filename = secure_filename(image.filename)
+        image.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
 
-    new_book = Book(
-        title=title,
-        author=author,
-        genre=request.form.get('genre'),
-        published_date=request.form.get('published_date'),
-        image_filename=filename
-    )
-    db.session.add(new_book)
-    db.session.commit()
-
-    return jsonify(message="Book added successfully"), 201
+        book = Book(
+            title=title,
+            author=author,
+            genre=request.form.get('genre'),
+            published_date=request.form.get('published_date'),
+            image_filename=filename
+        )
+        db.session.add(book)
+        db.session.commit()
+        return jsonify(message="Book added successfully", book=book.as_dict()), 201
+    except Exception as e:
+        logger.error(f"Error adding book: {str(e)}")
+        return jsonify(message="An error occurred while adding the book"), 500
 
 @app.route('/books/<int:id>', methods=['PUT'])
 @role_required('admin')
 def update_book(id):
     book = Book.query.get_or_404(id)
-    data = request.get_json()
-    book.title = data.get('title', book.title)
-    book.author = data.get('author', book.author)
-    book.genre = data.get('genre', book.genre)
-    book.published_date = data.get('published_date', book.published_date)
+    if book.is_deleted:
+        return jsonify(error="Book not found"), 404
+
+    data = request.form.to_dict()
+    for key, value in data.items():
+        setattr(book, key, value)
+    
+    if 'image' in request.files:
+        image = request.files['image']
+        if image and allowed_file(image.filename):
+            filename = secure_filename(image.filename)
+            image.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            book.image_filename = filename
+    
     db.session.commit()
-    return jsonify(message="Book updated successfully")
+    return jsonify(message="Book updated successfully", book=book.as_dict())
 
 @app.route('/books/<int:id>', methods=['DELETE'])
 @role_required('admin')
 def delete_book(id):
     book = Book.query.get_or_404(id)
+    if book.is_deleted:
+        return jsonify(error="Book not found"), 404
     book.is_deleted = True
     db.session.commit()
     return jsonify(message="Book deleted successfully")
 
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
 # CRUD operations for Customers
 @app.route('/customers', methods=['GET'])
-@role_required('admin')
+@jwt_required()
 def get_customers():
     customers = Customer.query.filter_by(is_deleted=False).all()
     return jsonify([customer.as_dict() for customer in customers])
 
 @app.route('/customers/<int:id>', methods=['GET'])
-@role_required('admin')
+@jwt_required()
 def get_customer(id):
     customer = Customer.query.get_or_404(id)
     if customer.is_deleted:
@@ -280,155 +298,89 @@ def get_customer(id):
 @role_required('admin')
 def add_customer():
     data = request.get_json()
-    new_customer = Customer(
-        user_id=data.get('user_id'),
-        name=data.get('name'),
-        phone_number=data.get('phone_number'),
-        email=data.get('email'),
-        address=data.get('address')
-    )
-    db.session.add(new_customer)
+    customer = Customer(**data)
+    db.session.add(customer)
     db.session.commit()
-    return jsonify(message="Customer added successfully"), 201
+    return jsonify(message="Customer added successfully", customer=customer.as_dict()), 201
 
 @app.route('/customers/<int:id>', methods=['PUT'])
 @role_required('admin')
 def update_customer(id):
     customer = Customer.query.get_or_404(id)
+    if customer.is_deleted:
+        return jsonify(error="Customer not found"), 404
+
     data = request.get_json()
-    customer.name = data.get('name', customer.name)
-    customer.phone_number = data.get('phone_number', customer.phone_number)
-    customer.email = data.get('email', customer.email)
-    customer.address = data.get('address', customer.address)
+    for key, value in data.items():
+        setattr(customer, key, value)
     db.session.commit()
-    return jsonify(message="Customer updated successfully")
+    return jsonify(message="Customer updated successfully", customer=customer.as_dict())
 
 @app.route('/customers/<int:id>', methods=['DELETE'])
 @role_required('admin')
 def delete_customer(id):
     customer = Customer.query.get_or_404(id)
+    if customer.is_deleted:
+        return jsonify(error="Customer not found"), 404
     customer.is_deleted = True
     db.session.commit()
     return jsonify(message="Customer deleted successfully")
 
 # CRUD operations for Loans
 @app.route('/loans', methods=['GET'])
-@role_required('admin')
+@jwt_required()
 def get_loans():
     loans = Loan.query.filter_by(is_deleted=False).all()
     loans_with_details = []
     for loan in loans:
         loan_dict = loan.as_dict()
-        loan_dict['book_title'] = Book.query.get(loan.book_id).title
-        loan_dict['customer_name'] = Customer.query.get(loan.customer_id).name
+        loan_dict['book_title'] = loan.book.title
+        loan_dict['customer_name'] = loan.customer.name
         loans_with_details.append(loan_dict)
     return jsonify(loans_with_details)
 
 @app.route('/loans/<int:id>', methods=['GET'])
-@role_required('admin')
+@jwt_required()
 def get_loan(id):
     loan = Loan.query.get_or_404(id)
     if loan.is_deleted:
         return jsonify(error="Loan not found"), 404
     loan_dict = loan.as_dict()
-    loan_dict['book_title'] = Book.query.get(loan.book_id).title
-    loan_dict['customer_name'] = Customer.query.get(loan.customer_id).name
+    loan_dict['book_title'] = loan.book.title
+    loan_dict['customer_name'] = loan.customer.name
     return jsonify(loan_dict)
-
 
 @app.route('/loans', methods=['POST'])
 @role_required('admin')
 def add_loan():
     data = request.get_json()
-    new_loan = Loan(
-        book_id=data.get('book_id'),
-        customer_id=data.get('customer_id'),
-        loan_date=data.get('loan_date'),
-        return_date=data.get('return_date'),
-        due_date=data.get('due_date')
-    )
-    db.session.add(new_loan)
+    loan = Loan(**data)
+    db.session.add(loan)
     db.session.commit()
-    return jsonify(message="Loan added successfully"), 201
+    return jsonify(message="Loan added successfully", loan=loan.as_dict()), 201
 
 @app.route('/loans/<int:id>', methods=['PUT'])
 @role_required('admin')
 def update_loan(id):
     loan = Loan.query.get_or_404(id)
+    if loan.is_deleted:
+        return jsonify(error="Loan not found"), 404
+
     data = request.get_json()
-    loan.book_id = data.get('book_id', loan.book_id)
-    loan.customer_id = data.get('customer_id', loan.customer_id)
-    loan.loan_date = data.get('loan_date', loan.loan_date)
-    loan.return_date = data.get('return_date', loan.return_date)
-    loan.due_date = data.get('due_date', loan.due_date)
-    loan.returned = data.get('returned', loan.returned)
+    for key, value in data.items():
+        setattr(loan, key, value)
     db.session.commit()
-    return jsonify(message="Loan updated successfully")
+    return jsonify(message="Loan updated successfully", loan=loan.as_dict())
 
 @app.route('/loans/<int:id>', methods=['DELETE'])
 @role_required('admin')
 def delete_loan(id):
     loan = Loan.query.get_or_404(id)
+    if loan.is_deleted:
+        return jsonify(error="Loan not found"), 404
     loan.is_deleted = True
     db.session.commit()
     return jsonify(message="Loan deleted successfully")
-
-# CRUD operations for Client Loans
-
-@app.route('/client/loans', methods=['GET'])
-@jwt_required()
-def get_client_loans():
-    current_user = get_jwt_identity()
-    customer = Customer.query.filter_by(user_id=current_user['id']).first_or_404()
-    
-    current_loans = Loan.query.filter_by(customer_id=customer.id, returned=False, is_deleted=False).all()
-    loan_history = Loan.query.filter_by(customer_id=customer.id, returned=True, is_deleted=False).all()
-
-    current_loans_with_details = []
-    for loan in current_loans:
-        loan_dict = loan.as_dict()
-        loan_dict['book_title'] = Book.query.get(loan.book_id).title
-        loan_dict['book_image'] = Book.query.get(loan.book_id).image_filename
-        current_loans_with_details.append(loan_dict)
-    
-    loan_history_with_details = []
-    for loan in loan_history:
-        loan_dict = loan.as_dict()
-        loan_dict['book_title'] = Book.query.get(loan.book_id).title
-        loan_dict['book_image'] = Book.query.get(loan.book_id).image_filename
-        loan_history_with_details.append(loan_dict)
-    
-    return jsonify({
-        'current_loans': current_loans_with_details,
-        'loan_history': loan_history_with_details
-    })
-
-@app.route('/client/loans', methods=['POST'])
-@jwt_required()
-def add_client_loan():
-    data = request.get_json()
-    current_user = get_jwt_identity()
-    customer = Customer.query.filter_by(user_id=current_user['id']).first_or_404()
-
-    new_loan = Loan(
-        book_id=data.get('book_id'),
-        customer_id=customer.id,
-        loan_date=data.get('loan_date'),
-        return_date=data.get('return_date'),
-        due_date=data.get('due_date')
-    )
-    db.session.add(new_loan)
-    db.session.commit()
-
-    return jsonify(message="Loan added successfully"), 201
-
-
-# Serve uploaded files
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
-# Run the app
 
 if __name__ == '__main__':
     with app.app_context():
