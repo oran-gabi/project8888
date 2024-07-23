@@ -11,6 +11,13 @@ import logging
 # Initialize the Flask app
 app = Flask(__name__)
 
+
+@app.after_request
+def add_csp_header(response):
+    csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self';"
+    response.headers['Content-Security-Policy'] = csp
+    return response
+
 # Configure the app
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///library.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -283,16 +290,25 @@ def uploaded_file(filename):
 @app.route('/customers', methods=['GET'])
 @jwt_required()
 def get_customers():
-    customers = Customer.query.filter_by(is_deleted=False).all()
-    return jsonify([customer.as_dict() for customer in customers])
+    page = request.args.get('page', type=int, default=1)
+    per_page = request.args.get('per_page', type=int, default=10)
 
-@app.route('/customers/<int:id>', methods=['GET'])
-@jwt_required()
-def get_customer(id):
-    customer = Customer.query.get_or_404(id)
-    if customer.is_deleted:
-        return jsonify(error="Customer not found"), 404
-    return jsonify(customer.as_dict())
+    if page < 1 or per_page < 1:
+        return jsonify({'msg': 'Invalid page or per_page values'}), 422
+
+    customers = Customer.query.paginate(page, per_page, False)
+    total_items = customers.total
+    total_pages = customers.pages
+    current_page = customers.page
+
+    data = {
+        'customers': [customer.as_dict() for customer in customers.items],
+        'total_items': total_items,
+        'total_pages': total_pages,
+        'current_page': current_page
+    }
+
+    return jsonify(data)
 
 @app.route('/customers', methods=['POST'])
 @role_required('admin')
@@ -381,6 +397,84 @@ def delete_loan(id):
     loan.is_deleted = True
     db.session.commit()
     return jsonify(message="Loan deleted successfully")
+
+
+# Client-specific loan operations
+
+@app.route('/client/loans', methods=['GET'])
+@jwt_required()
+def get_client_loans():
+    current_user = get_jwt_identity()
+    customer = Customer.query.filter_by(user_id=current_user['username']).first()
+    if not customer:
+        return jsonify(message="Customer not found"), 404
+
+    loans = Loan.query.filter_by(customer_id=customer.id, is_deleted=False).all()
+    loans_with_details = []
+    for loan in loans:
+        loan_dict = loan.as_dict()
+        loan_dict['book_title'] = loan.book.title
+        loan_dict['loan_date'] = loan.loan_date
+        loan_dict['return_date'] = loan.return_date
+        loans_with_details.append(loan_dict)
+    return jsonify(loans_with_details)
+
+@app.post('/client/loans')
+@jwt_required()
+def post_loan():
+    data = request.get_json()
+    book_id = data.get('book_id')
+    loan_date = data.get('loan_date')
+    customer_id = data.get('customer_id')
+
+    # Validate input
+    if not book_id or not loan_date or not customer_id:
+        return jsonify({"msg": "Missing data"}), 400
+
+    # Create a new loan record
+    new_loan = Loan(book_id=book_id, loan_date=loan_date, customer_id=customer_id)
+
+    # Add loan to the database
+    db.session.add(new_loan)
+    db.session.commit()
+
+    return jsonify({"msg": "Loan created successfully"}), 201
+
+@app.route('/client/loan_requests', methods=['POST'])
+@jwt_required()
+def request_loan():
+    current_user = get_jwt_identity()
+    customer = Customer.query.filter_by(user_id=current_user['username']).first()
+    if not customer:
+        return jsonify(message="Customer not found"), 404
+
+    data = request.get_json()
+    loan = Loan(customer_id=customer.id, **data)
+    db.session.add(loan)
+    db.session.commit()
+    return jsonify(message="Loan requested successfully", loan=loan.as_dict()), 201
+
+@app.route('/client/loans/<int:id>', methods=['PUT'])
+@jwt_required()
+def return_loan(id):
+    current_user = get_jwt_identity()
+    customer = Customer.query.filter_by(user_id=current_user['username']).first()
+    if not customer:
+        return jsonify(message="Customer not found"), 404
+
+    loan = Loan.query.get_or_404(id)
+    if loan.customer_id != customer.id or loan.is_deleted:
+        return jsonify(error="Loan not found or access denied"), 404
+
+    data = request.get_json()
+    for key, value in data.items():
+        setattr(loan, key, value)
+    loan.returned = True
+    db.session.commit()
+    return jsonify(message="Loan updated successfully", loan=loan.as_dict())
+
+
+
 
 if __name__ == '__main__':
     with app.app_context():
